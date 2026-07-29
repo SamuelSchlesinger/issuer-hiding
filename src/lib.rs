@@ -87,6 +87,17 @@ pub struct SelectiveDisclosureProof {
     pub z_r2: Scalar,
 }
 
+fn valid_disclosure_shape(
+    message_count: usize,
+    disclosed_messages: &BTreeMap<usize, Scalar>,
+    hidden_responses: &BTreeMap<usize, Scalar>,
+) -> bool {
+    disclosed_messages.len() + hidden_responses.len() == message_count
+        && (0..message_count).all(|i| {
+            disclosed_messages.contains_key(&i) != hidden_responses.contains_key(&i)
+        })
+}
+
 // ============================================================================
 // 1. Generate a BBS Credential
 // ============================================================================
@@ -102,10 +113,13 @@ pub mod signing {
     ) -> Credential {
         assert_eq!(messages.len(), params.h.len(), "Message count must match parameters");
 
-        let e = Scalar::random(&mut rng);
         let c = msm::compute_C(params, messages, MultiexpMode::Advanced);
-        let x_plus_e = sk.0 + e;
-        let x_plus_e_inv = x_plus_e.invert().expect("x + e should not be zero");
+        let (e, x_plus_e_inv) = loop {
+            let e = Scalar::random(&mut rng);
+            if let Some(inverse) = (sk.0 + e).invert() {
+                break (e, inverse);
+            }
+        };
         let a = c * x_plus_e_inv;
         // This could be optimized by computing `a` using one MSM,
         // without computing `c` first
@@ -131,21 +145,11 @@ pub mod verification {
             return false;
         }
 
-        let mut bases = Vec::with_capacity(2 + messages.len());
-        let mut scalars = Vec::with_capacity(2 + messages.len());
-
-        bases.push(params.g1);
-        scalars.push(Scalar::one());
-
-        for i in 0..messages.len() {
-            bases.push(params.h[i]);
-            scalars.push(messages[i]);
+        let c = msm::compute_C(params, messages, MultiexpMode::Advanced);
+        if c == G1Projective::identity() {
+            return false;
         }
-
-        bases.push(credential.A);
-        scalars.push(-credential.e);
-
-        let a_e_plus_c = multiexp_advanced(&bases, &scalars);
+        let a_e_plus_c = c - credential.A * credential.e;
 
         let g1_left = credential.A.to_affine();
         let g2_left = pk.pk2.to_affine();
@@ -170,14 +174,22 @@ pub mod proving {
         A_bar: &G1Projective,
         com1: &G1Projective,
         com2: &G1Projective,
+        revealed_messages: &BTreeMap<usize, Scalar>,
         context: &[u8],
     ) -> Scalar {
         let mut hasher = Sha256::new();
+        hasher.update(b"bbs-selective-disclosure-v1");
         hasher.update(A_prime.to_affine().to_compressed());
         hasher.update(C_bar.to_affine().to_compressed());
         hasher.update(A_bar.to_affine().to_compressed());
         hasher.update(com1.to_affine().to_compressed());
         hasher.update(com2.to_affine().to_compressed());
+        hasher.update((revealed_messages.len() as u64).to_be_bytes());
+        for (&index, message) in revealed_messages {
+            hasher.update((index as u64).to_be_bytes());
+            hasher.update(message.to_bytes());
+        }
+        hasher.update((context.len() as u64).to_be_bytes());
         hasher.update(context);
 
         let result = hasher.finalize();
@@ -197,10 +209,11 @@ pub mod proving {
     ) -> SelectiveDisclosureProof {
         let total_messages = messages.len();
         assert_eq!(total_messages, params.h.len());
+        assert!(revealed_indices.iter().all(|&i| i < total_messages));
 
-        let r1 = Scalar::random(&mut rng);
-        let r2 = Scalar::random(&mut rng);
-        let r1_inv = r1.invert().expect("r1 should not be zero");
+        let r1 = Scalar::random_nonzero(&mut rng);
+        let r2 = Scalar::random_nonzero(&mut rng);
+        let r1_inv = r1.invert().unwrap();
         let A_prime = credential.A * (r1 * r2);
 
         let mut bases = Vec::with_capacity(1 + messages.len());
@@ -244,7 +257,19 @@ pub mod proving {
         }
         let com2 = multiexp_advanced(&bases, &scalars);
 
-        let challenge = hash_to_challenge(&A_prime, &C_bar, &A_bar, &com1, &com2, context);
+        let revealed_messages = revealed_indices
+            .iter()
+            .map(|&i| (i, messages[i]))
+            .collect();
+        let challenge = hash_to_challenge(
+            &A_prime,
+            &C_bar,
+            &A_bar,
+            &com1,
+            &com2,
+            &revealed_messages,
+            context,
+        );
 
         let z_r1 = tau_r1 + challenge * r1_inv;
         let z_r2 = tau_r2 + challenge * r2;
@@ -281,14 +306,22 @@ pub mod proof_verification {
         A_bar: &G1Projective,
         com1: &G1Projective,
         com2: &G1Projective,
+        revealed_messages: &BTreeMap<usize, Scalar>,
         context: &[u8],
     ) -> Scalar {
         let mut hasher = Sha256::new();
+        hasher.update(b"bbs-selective-disclosure-v1");
         hasher.update(A_prime.to_affine().to_compressed());
         hasher.update(C_bar.to_affine().to_compressed());
         hasher.update(A_bar.to_affine().to_compressed());
         hasher.update(com1.to_affine().to_compressed());
         hasher.update(com2.to_affine().to_compressed());
+        hasher.update((revealed_messages.len() as u64).to_be_bytes());
+        for (&index, message) in revealed_messages {
+            hasher.update((index as u64).to_be_bytes());
+            hasher.update(message.to_bytes());
+        }
+        hasher.update((context.len() as u64).to_be_bytes());
         hasher.update(context);
 
         let result = hasher.finalize();
@@ -305,6 +338,24 @@ pub mod proof_verification {
         context: &[u8],
         proof: &SelectiveDisclosureProof,
     ) -> bool {
+        if proof.A_prime == G1Projective::identity()
+            || !valid_disclosure_shape(
+                params.h.len(),
+                revealed_messages,
+                &proof.z_hidden_messages,
+            )
+        {
+            return false;
+        }
+
+        let a_prime = proof.A_prime.to_affine();
+        let pk2 = pk.pk2.to_affine();
+        let neg_a_bar = (-proof.A_bar).to_affine();
+        let g2 = params.g2.to_affine();
+        if !multi_pairing(&[(&a_prime, &pk2), (&neg_a_bar, &g2)]) {
+            return false;
+        }
+
         let computed_com1 = multiexp_advanced(
             &[proof.A_prime, proof.C_bar, proof.A_bar],
             &[-proof.z_e, proof.z_r2, -proof.challenge],
@@ -337,6 +388,7 @@ pub mod proof_verification {
             &proof.A_bar,
             &computed_com1,
             &computed_com2,
+            revealed_messages,
             context,
         );
 
@@ -479,6 +531,22 @@ pub mod issuer_hiding {
         pub zkpok: IssuerHidingZKPoK,
     }
 
+    fn valid_policy_key(params: &Parameters, pk: &PublicKey) -> bool {
+        if pk.pk1 == G1Projective::identity()
+            || pk.pk2 == G2Projective::identity()
+            || !pk.pk1.is_in_subgroup()
+            || !pk.pk2.is_in_subgroup()
+        {
+            return false;
+        }
+
+        let g1 = params.g1.to_affine();
+        let pk2 = pk.pk2.to_affine();
+        let neg_pk1 = (-pk.pk1).to_affine();
+        let g2 = params.g2.to_affine();
+        multi_pairing(&[(&g1, &pk2), (&neg_pk1, &g2)])
+    }
+
     /// Generate an issuer-hiding proof.
     pub fn generate_issuer_hiding_proof(
         params: &Parameters,
@@ -492,6 +560,8 @@ pub mod issuer_hiding {
         mut rng: impl rand_core::CryptoRngCore,
     ) -> IssuerHidingProof {
         assert_eq!(messages.len(), params.h.len());
+        assert!(policy.len() > 1, "policy must contain at least two issuers");
+        assert!(disclosed_indices.iter().all(|&i| i < messages.len()));
 
         let l = policy.len();
         assert!(my_pk_index < l, "my_pk_index out of bounds");
@@ -509,8 +579,8 @@ pub mod issuer_hiding {
 
         // 3. Choose random r1, r2
         // and compute blinded signature points A', C_bar, and \bar{A}
-        let r1 = Scalar::random(&mut rng);
-        let r2 = Scalar::random(&mut rng);
+        let r1 = Scalar::random_nonzero(&mut rng);
+        let r2 = Scalar::random_nonzero(&mut rng);
         let A_prime = credential.A * (r1 * r2);
 
         let mut bases = Vec::with_capacity(1 + messages.len());
@@ -575,6 +645,15 @@ pub mod issuer_hiding {
         mode: IssuerHidingMode,
         rng: impl rand_core::CryptoRngCore,
     ) -> IssuerHidingZKPoK {
+        assert_eq!(messages.len(), params.h.len());
+        assert!(policy.len() > 1, "policy must contain at least two issuers");
+        assert!(i_star < policy.len(), "i_star out of bounds");
+        assert!(disclosed_indices.iter().all(|&i| i < messages.len()));
+        assert!(
+            policy.iter().all(|pk| valid_policy_key(params, pk)),
+            "policy contains an invalid public key"
+        );
+
         match mode {
             IssuerHidingMode::NaiveFast => generate_issuer_hiding_zkpok_NaiveFast(
                 params,
@@ -661,7 +740,6 @@ pub mod issuer_hiding {
             Some(a) => a,
             None => return false,
         };
-        let bpk = G2Projective::from(bpk_affine);
 
         let bpk_prime_affine = match G1Affine::from_compressed(&proof.bpk_prime) {
             Some(a) => a,
@@ -694,7 +772,7 @@ pub mod issuer_hiding {
         // 1. Randomized check that e(g1, bpk) == e(bpk_prime, g2)
         // and e(A', bpk) == e(A_bar, g2). We choose a random scalar r
         // and check that e((A')^r g1, bpk) == e(A_bar^r bpk_prime, g2)
-        let r = Scalar::random(&mut rng);
+        let r = Scalar::random_nonzero(&mut rng);
         let g1_left = (A_prime * r + params.g1).to_affine();
         let g2_left = bpk_affine;
         let g1_right_neg = (-(A_bar * r + bpk_prime)).to_affine();
@@ -735,6 +813,28 @@ pub mod issuer_hiding {
         mode: IssuerHidingMode,
         rng: impl rand_core::CryptoRngCore,
     ) -> bool {
+        if policy.len() < 2 || !policy.iter().all(|pk| valid_policy_key(params, pk)) {
+            return false;
+        }
+
+        let z_hidden_messages = match proof {
+            IssuerHidingZKPoK::NaiveFast {
+                z_hidden_messages, ..
+            }
+            | IssuerHidingZKPoK::NaiveShort {
+                z_hidden_messages, ..
+            }
+            | IssuerHidingZKPoK::GK {
+                z_hidden_messages, ..
+            }
+            | IssuerHidingZKPoK::StackedSigmas {
+                z_hidden_messages, ..
+            } => z_hidden_messages,
+        };
+        if !valid_disclosure_shape(params.h.len(), disclosed_messages, z_hidden_messages) {
+            return false;
+        }
+
         match (mode, proof) {
             (
                 IssuerHidingMode::NaiveFast,
@@ -887,14 +987,18 @@ pub mod issuer_hiding {
         context: &[u8],
     ) -> Scalar {
         let mut hasher = Sha256::new();
+        hasher.update(b"issuer-hiding-naive-v1");
+        hasher.update((policy.len() as u64).to_be_bytes());
 
         for pk in policy {
+            hasher.update(pk.pk2.to_affine().to_compressed());
             hasher.update(pk.pk1.to_affine().to_compressed());
         }
 
+        hasher.update((disclosed_messages.len() as u64).to_be_bytes());
         for (&idx, msg) in disclosed_messages {
-            hasher.update(&(idx as u64).to_be_bytes());
-            hasher.update(&msg.to_bytes());
+            hasher.update((idx as u64).to_be_bytes());
+            hasher.update(msg.to_bytes());
         }
 
         hasher.update(bpk_prime.to_affine().to_compressed());
@@ -908,6 +1012,7 @@ pub mod issuer_hiding {
             hasher.update(com.to_affine().to_compressed());
         }
 
+        hasher.update((context.len() as u64).to_be_bytes());
         hasher.update(context);
 
         let result = hasher.finalize();
@@ -1395,14 +1500,18 @@ pub mod issuer_hiding {
         context: &[u8],
     ) -> Scalar {
         let mut hasher = Sha256::new();
+        hasher.update(b"issuer-hiding-gk-v1");
+        hasher.update((policy.len() as u64).to_be_bytes());
 
         for pk in policy {
+            hasher.update(pk.pk2.to_affine().to_compressed());
             hasher.update(pk.pk1.to_affine().to_compressed());
         }
 
+        hasher.update((disclosed_messages.len() as u64).to_be_bytes());
         for (&idx, msg) in disclosed_messages {
-            hasher.update(&(idx as u64).to_be_bytes());
-            hasher.update(&msg.to_bytes());
+            hasher.update((idx as u64).to_be_bytes());
+            hasher.update(msg.to_bytes());
         }
 
         hasher.update(bpk_prime.to_affine().to_compressed());
@@ -1426,6 +1535,7 @@ pub mod issuer_hiding {
             hasher.update(com.to_affine().to_compressed());
         }
 
+        hasher.update((context.len() as u64).to_be_bytes());
         hasher.update(context);
 
         let result = hasher.finalize();
@@ -1800,14 +1910,18 @@ pub mod issuer_hiding {
         context: &[u8],
     ) -> Scalar {
         let mut hasher = Sha256::new();
+        hasher.update(b"issuer-hiding-stacked-sigmas-v1");
+        hasher.update((policy.len() as u64).to_be_bytes());
 
         for pk in policy {
+            hasher.update(pk.pk2.to_affine().to_compressed());
             hasher.update(pk.pk1.to_affine().to_compressed());
         }
 
+        hasher.update((disclosed_messages.len() as u64).to_be_bytes());
         for (&idx, msg) in disclosed_messages {
-            hasher.update(&(idx as u64).to_be_bytes());
-            hasher.update(&msg.to_bytes());
+            hasher.update((idx as u64).to_be_bytes());
+            hasher.update(msg.to_bytes());
         }
 
         hasher.update(bpk_prime.to_affine().to_compressed());
@@ -1823,6 +1937,7 @@ pub mod issuer_hiding {
         }
         hasher.update(com_ss.compress().as_bytes());
 
+        hasher.update((context.len() as u64).to_be_bytes());
         hasher.update(context);
 
         let result = hasher.finalize();
@@ -2080,5 +2195,141 @@ pub mod issuer_hiding {
 
         // 4. Reconstruct Ristretto tree and verify root
         one_of_l_commitments::verify_1_of_l(&params_ss_points, &com_ss_point, &decom_ss_scalars, &A)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn credential_rejects_identity_commitment() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let g1 = G1Projective::generator();
+        let params = Parameters {
+            g1,
+            g2: G2Projective::generator(),
+            h: vec![-g1],
+        };
+        let pk = SecretKey::random(&mut rng).public_key(&params);
+        let credential = Credential {
+            A: G1Projective::identity(),
+            e: Scalar::zero(),
+        };
+
+        assert!(!credential.verify(&params, &pk, &[Scalar::one()]));
+    }
+
+    fn selective_disclosure_fixture() -> (
+        StdRng,
+        Parameters,
+        PublicKey,
+        [Scalar; 2],
+        SelectiveDisclosureProof,
+    ) {
+        let mut rng = StdRng::seed_from_u64(2);
+        let params = Parameters::new(2, &mut rng);
+        let issuer_sk = SecretKey::random(&mut rng);
+        let issuer_pk = issuer_sk.public_key(&params);
+        let messages = [Scalar::from(7), Scalar::from(8)];
+        let credential = Credential::generate_credential(&params, &issuer_sk, &messages, &mut rng);
+        let proof = SelectiveDisclosureProof::prove(
+            &params,
+            &credential,
+            &messages,
+            &BTreeSet::new(),
+            b"ctx",
+            &mut rng,
+        );
+        (rng, params, issuer_pk, messages, proof)
+    }
+
+    #[test]
+    fn selective_disclosure_rejects_wrong_issuer() {
+        let (mut rng, params, _, _, proof) = selective_disclosure_fixture();
+        let other_pk = SecretKey::random(&mut rng).public_key(&params);
+        assert!(!proof.verify(&params, &other_pk, &BTreeMap::new(), b"ctx"));
+    }
+
+    #[test]
+    fn selective_disclosure_rejects_false_message() {
+        let (_, params, issuer_pk, messages, mut proof) = selective_disclosure_fixture();
+        let false_message = proof.z_hidden_messages[&0] * proof.challenge.invert().unwrap();
+        assert_ne!(false_message, messages[0]);
+        proof.z_hidden_messages.remove(&0);
+        assert!(!proof.verify(
+            &params,
+            &issuer_pk,
+            &BTreeMap::from([(0, false_message)]),
+            b"ctx",
+        ));
+    }
+
+    fn issuer_hiding_fixture() -> (
+        StdRng,
+        Parameters,
+        Vec<PublicKey>,
+        BTreeMap<usize, Scalar>,
+        issuer_hiding::IssuerHidingProof,
+    ) {
+        let mut rng = StdRng::seed_from_u64(3);
+        let params = Parameters::new(2, &mut rng);
+        let issuer_sk = SecretKey::random(&mut rng);
+        let issuer_pk = issuer_sk.public_key(&params);
+        let decoy_pk = SecretKey::random(&mut rng).public_key(&params);
+        let policy = vec![issuer_pk, decoy_pk];
+        let messages = [Scalar::from(11), Scalar::from(22)];
+        let credential = Credential::generate_credential(&params, &issuer_sk, &messages, &mut rng);
+        let disclosed_indices = BTreeSet::from([0]);
+        let disclosed_messages = BTreeMap::from([(0, messages[0])]);
+        let proof = issuer_hiding::generate_issuer_hiding_proof(
+            &params,
+            &policy,
+            &disclosed_indices,
+            &messages,
+            b"ctx",
+            &credential,
+            0,
+            issuer_hiding::IssuerHidingMode::NaiveShort,
+            &mut rng,
+        );
+        (rng, params, policy, disclosed_messages, proof)
+    }
+
+    #[test]
+    fn issuer_hiding_rejects_inconsistent_policy_key() {
+        let (mut rng, params, policy, disclosed_messages, proof) = issuer_hiding_fixture();
+        let mut invalid_policy = policy.clone();
+        invalid_policy[0].pk2 = SecretKey::random(&mut rng).public_key(&params).pk2;
+        assert!(!issuer_hiding::verify_issuer_hiding_proof(
+            &params,
+            &invalid_policy,
+            &disclosed_messages,
+            b"ctx",
+            &proof,
+            issuer_hiding::IssuerHidingMode::NaiveShort,
+            &mut rng,
+        ));
+    }
+
+    #[test]
+    fn issuer_hiding_rejects_missing_hidden_response() {
+        let (mut rng, params, policy, disclosed_messages, mut proof) = issuer_hiding_fixture();
+        if let issuer_hiding::IssuerHidingZKPoK::NaiveShort {
+            z_hidden_messages, ..
+        } = &mut proof.zkpok
+        {
+            z_hidden_messages.clear();
+        }
+        assert!(!issuer_hiding::verify_issuer_hiding_proof(
+            &params,
+            &policy,
+            &disclosed_messages,
+            b"ctx",
+            &proof,
+            issuer_hiding::IssuerHidingMode::NaiveShort,
+            &mut rng,
+        ));
     }
 }

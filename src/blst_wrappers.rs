@@ -38,6 +38,15 @@ impl Scalar {
         }
     }
 
+    pub fn random_nonzero(mut rng: impl CryptoRngCore) -> Self {
+        loop {
+            let scalar = Self::random(&mut rng);
+            if !scalar.is_zero() {
+                return scalar;
+            }
+        }
+    }
+
     pub fn invert(&self) -> Option<Self> {
         if self.is_zero() {
             return None;
@@ -228,6 +237,10 @@ impl G1Projective {
             Self(ret.assume_init())
         }
     }
+
+    pub fn is_in_subgroup(&self) -> bool {
+        unsafe { blst_p1_in_g1(&self.0) }
+    }
 }
 
 impl core::ops::Add for G1Projective {
@@ -294,7 +307,7 @@ impl G1Affine {
         let mut p = blst_p1_affine::default();
         unsafe {
             let err = blst_p1_uncompress(&mut p, bytes.as_ptr());
-            if err == BLST_ERROR::BLST_SUCCESS {
+            if err == BLST_ERROR::BLST_SUCCESS && blst_p1_affine_in_g1(&p) {
                 Some(Self(p))
             } else {
                 None
@@ -321,6 +334,10 @@ impl G2Projective {
             blst_p2_to_affine(ret.as_mut_ptr(), &self.0);
             G2Affine(ret.assume_init())
         }
+    }
+
+    pub fn is_in_subgroup(&self) -> bool {
+        unsafe { blst_p2_in_g2(&self.0) }
     }
 }
 
@@ -364,7 +381,7 @@ impl G2Affine {
         let mut p = blst_p2_affine::default();
         unsafe {
             let err = blst_p2_uncompress(&mut p, bytes.as_ptr());
-            if err == BLST_ERROR::BLST_SUCCESS {
+            if err == BLST_ERROR::BLST_SUCCESS && blst_p2_affine_in_g2(&p) {
                 Some(Self(p))
             } else {
                 None
@@ -429,5 +446,42 @@ impl core::ops::Mul<&PrecomputedScalar> for G1Projective {
             blst_p1_mult(ret.as_mut_ptr(), &self.0, other.0.b.as_ptr(), 255);
             Self(ret.assume_init())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_subgroup_encoding() {
+        let point = blst_p1_affine {
+            x: blst_fp {
+                l: [
+                    0x0aba_f895_b97e_43c8,
+                    0xba4c_6432_eb9b_61b0,
+                    0x1250_6f52_adfe_307f,
+                    0x7502_8c34_3933_6b72,
+                    0x8474_4f05_b8e9_bd71,
+                    0x113d_554f_b095_54f7,
+                ],
+            },
+            y: blst_fp {
+                l: [
+                    0x73e9_0e88_f5cf_01c0,
+                    0x3700_7b65_dd31_97e2,
+                    0x5cf9_a199_2f0d_7c78,
+                    0x4f83_c10b_9eb3_330d,
+                    0xf6a6_3f6f_07f6_0961,
+                    0x0c53_b5b9_7e63_4df3,
+                ],
+            },
+        };
+        assert!(unsafe { blst_p1_affine_on_curve(&point) });
+        assert!(!unsafe { blst_p1_affine_in_g1(&point) });
+
+        let mut encoded = [0u8; 48];
+        unsafe { blst_p1_affine_compress(encoded.as_mut_ptr(), &point) };
+        assert!(G1Affine::from_compressed(&encoded).is_none());
     }
 }
